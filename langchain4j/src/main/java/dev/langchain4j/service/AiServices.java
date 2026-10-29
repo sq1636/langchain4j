@@ -6,9 +6,9 @@ import static dev.langchain4j.spi.ServiceHelper.loadFactory;
 import static java.util.Arrays.asList;
 import static java.util.stream.Collectors.toList;
 
+import dev.langchain4j.Experimental;
 import dev.langchain4j.Internal;
 import dev.langchain4j.agent.tool.ReturnBehavior;
-import dev.langchain4j.invocation.InvocationContext;
 import dev.langchain4j.agent.tool.Tool;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
@@ -21,11 +21,15 @@ import dev.langchain4j.guardrail.InputGuardrail;
 import dev.langchain4j.guardrail.OutputGuardrail;
 import dev.langchain4j.guardrail.config.InputGuardrailsConfig;
 import dev.langchain4j.guardrail.config.OutputGuardrailsConfig;
+import dev.langchain4j.invocation.InvocationContext;
 import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.memory.chat.ChatMemoryProvider;
+import dev.langchain4j.model.ModelProvider;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
+import dev.langchain4j.model.chat.request.ChatRequestParameters;
+import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.chat.response.CompleteToolCall;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.input.structured.StructuredPrompt;
@@ -43,6 +47,7 @@ import dev.langchain4j.service.tool.AiServiceTool;
 import dev.langchain4j.service.tool.BeforeToolExecution;
 import dev.langchain4j.service.tool.DefaultToolExecutor;
 import dev.langchain4j.service.tool.ToolArgumentsErrorHandler;
+import dev.langchain4j.service.tool.ToolErrorHandlerResult;
 import dev.langchain4j.service.tool.ToolExecution;
 import dev.langchain4j.service.tool.ToolExecutionErrorHandler;
 import dev.langchain4j.service.tool.ToolExecutor;
@@ -76,7 +81,8 @@ import java.util.function.UnaryOperator;
  * <p>
  * Currently, AI Services support:
  * <pre>
- * - Static system message templates, configured via @{@link SystemMessage} annotation on top of the method
+ * - Static system message templates, configured via @{@link SystemMessage} annotation
+ *   on top of the method or on the AI Service interface
  * - Dynamic system message templates, configured via {@link #systemMessageProvider(Function)}
  * - Static user message templates, configured via @{@link UserMessage} annotation on top of the method
  * - Dynamic user message templates, configured via method parameter annotated with @{@link UserMessage}
@@ -86,6 +92,8 @@ import java.util.function.UnaryOperator;
  * - Tools, configured via {@link #tools(Collection)}, {@link #tools(Object...)}, {@link #tools(Map)} or {@link #toolProvider(ToolProvider)} and methods annotated with @{@link Tool}
  * - Various method return types (output parsers), see more details below
  * - Streaming (use {@link TokenStream} as a return type)
+ * - Non-blocking invocation (use {@link java.util.concurrent.CompletableFuture} or
+ *   {@link java.util.concurrent.Flow.Publisher} as a return type; experimental)
  * - Structured prompts as method arguments (see @{@link StructuredPrompt})
  * - Auto-moderation, configured via @{@link Moderate} annotation
  * </pre>
@@ -106,13 +114,16 @@ import java.util.function.UnaryOperator;
  *
  * <pre>
  * The return type of methods in your AI Service can be any of the following:
- * - a {@link String} or an {@link AiMessage}, if you want to get the answer from the LLM as-is
+ * - a {@link String}, an {@link AiMessage} or a {@link ChatResponse}, if you want to get the answer from the LLM as-is
  * - a {@code List<String>} or {@code Set<String>}, if you want to receive the answer as a collection of items or bullet points
  * - any {@link Enum} or a {@code boolean}, if you want to use the LLM for classification
  * - a primitive or boxed Java type: {@code int}, {@code Double}, etc., if you want to use the LLM for data extraction
  * - many default Java types: {@code Date}, {@code LocalDateTime}, {@code BigDecimal}, etc., if you want to use the LLM for data extraction
  * - any custom POJO, if you want to use the LLM for data extraction.
  * - Result&lt;T&gt; if you want to access {@link TokenUsage} or sources ({@link Content}s retrieved during RAG), aside from T, which can be of any type listed above. For example: Result&lt;String&gt;, Result&lt;MyCustomPojo&gt;
+ * - {@link TokenStream}, if you want to receive the answer token by token via callbacks
+ * - {@link java.util.concurrent.CompletableFuture}&lt;T&gt; or {@link java.util.concurrent.CompletionStage}&lt;T&gt;, if you want one answer without blocking the calling thread (experimental)
+ * - {@link java.util.concurrent.Flow.Publisher}&lt;{@link AiServiceStreamingEvent}&gt; or {@link java.util.concurrent.Flow.Publisher}&lt;{@link String}&gt;, if you want the interaction streamed without blocking the calling thread (experimental)
  * For POJOs, it is advisable to use the "json mode" feature if the LLM provider supports it. For OpenAI, this can be enabled by calling {@code responseFormat("json_object")} during model construction.
  *
  * </pre>
@@ -149,6 +160,14 @@ import java.util.function.UnaryOperator;
  * </pre>
  * <p>
  * See more examples <a href="https://github.com/langchain4j/langchain4j-examples/tree/main/other-examples/src/main/java">here</a>.
+ * <p>
+ * <b>Asynchronous and reactive return types are experimental.</b> Alongside the synchronous return types and
+ * {@link TokenStream}, an AI Service method can return a {@link java.util.concurrent.CompletableFuture} (one
+ * response, produced without blocking the calling thread) or a {@link java.util.concurrent.Flow.Publisher}
+ * (a stream of {@link AiServiceStreamingEvent}s, or of {@link String} text chunks). These two modes, and the
+ * asynchronous counterparts they build on across the stack - chat models, chat memory, guardrails, tools and
+ * RAG - are annotated {@link dev.langchain4j.Experimental}: their APIs and behavior may still change in a
+ * future release. The synchronous and {@link TokenStream} APIs are unaffected.
  *
  * @param <T> The interface for which AiServices will provide an implementation.
  */
@@ -274,6 +293,29 @@ public abstract class AiServices<T> {
      */
     public AiServices<T> systemMessageProvider(Function<Object, String> systemMessageProvider) {
         context.systemMessageProvider = systemMessageProvider.andThen(Optional::ofNullable);
+        return this;
+    }
+
+    /**
+     * Configures a system message provider that provides a system message each time an AI service is invoked.
+     * <p>
+     * This is similar to {@link #systemMessageProvider(Function)}, but the provider receives the full
+     * {@link InvocationContext}, which exposes the {@link ChatRequestParameters} and {@link ModelProvider}
+     * of the {@link ChatModel} or {@link StreamingChatModel} configured for this AI service,
+     * allowing the system message to vary based on the model used.
+     * <p>
+     * When both {@code @SystemMessage} and this provider are configured,
+     * {@code @SystemMessage} takes precedence.
+     *
+     * @param systemMessageProvider A {@link Function} that accepts an {@link InvocationContext}
+     *                              and returns a system message to be used.
+     *                              The returned {@link String} can be either a complete system message
+     *                              or a system message template containing unresolved template variables (e.g. "{{name}}"),
+     *                              which will be resolved using the values of method parameters annotated with @{@link V}.
+     * @return builder
+     */
+    public AiServices<T> systemMessageProviderWithContext(Function<InvocationContext, String> systemMessageProvider) {
+        context.systemMessageProviderWithContext = systemMessageProvider;
         return this;
     }
 
@@ -585,7 +627,10 @@ public abstract class AiServices<T> {
     }
 
     /**
-     * By default, when the LLM calls multiple tools, the AI Service executes them sequentially.
+     * By default, when the LLM calls multiple tools, the synchronous and {@link TokenStream} modes execute them
+     * sequentially. (The asynchronous and reactive modes always run tools on an {@link Executor} and therefore
+     * execute them concurrently by default; pass a single-threaded {@link Executor} to
+     * {@link #executeToolsConcurrently(Executor)} to serialize them there.)
      * If you enable this option, tools will be executed concurrently (with one exception - see below),
      * using the default {@link Executor}.
      * You can also specify your own {@link Executor}, see {@link #executeToolsConcurrently(Executor)}.
@@ -624,6 +669,15 @@ public abstract class AiServices<T> {
      * See {@link #executeToolsConcurrently()}'s Javadoc for more info.
      * <p>
      * If {@code null} is specified, the default {@link Executor} will be used.
+     * <p>
+     * <b>Running tools sequentially.</b> The asynchronous AI Service modes (methods returning a
+     * {@link java.util.concurrent.CompletableFuture} or a reactive {@link java.util.concurrent.Flow.Publisher})
+     * execute tools concurrently by default. To run them one at a time instead — e.g. for tools that are not
+     * thread-safe, that must preserve the order of their side effects, or that need to be rate-limited — pass a
+     * single-threaded executor such as {@link java.util.concurrent.Executors#newSingleThreadExecutor()}. Tools
+     * are then submitted in request order and executed serially, while still being kept off the
+     * model-response thread. (The synchronous and {@link TokenStream} modes already execute tools sequentially
+     * by default.)
      *
      * @param executor The {@link Executor} to be used to execute tools.
      * @return builder
@@ -636,23 +690,51 @@ public abstract class AiServices<T> {
     }
 
     /**
-     * Sets the maximum number of times the LLM may respond with tool calls.
+     * Sets the maximum number of tool calling round trips (i.e. LLM responses containing tool calls).
      * If this limit is exceeded, an exception is thrown and the AI service invocation is terminated.
      *
      * <p>
-     * NOTE: This value does not represent the total number of tool calls.
-     * Each LLM response that contains one or more tool calls counts as a single invocation
+     * NOTE: This value does not represent the total number of individual tool calls.
+     * Each LLM response that contains one or more tool calls counts as a single round trip
      * and reduces this limit by one.
      *
      * <p>
      * The default value is 100.
      *
-     * @param maxSequentialToolsInvocations the maximum number of LLM responses containing tool calls
+     * @param maxToolCallingRoundTrips the maximum number of LLM responses containing tool calls
      * @return the builder instance
      */
-    public AiServices<T> maxSequentialToolsInvocations(int maxSequentialToolsInvocations) {
-        context.toolService.maxSequentialToolsInvocations(maxSequentialToolsInvocations);
+    public AiServices<T> maxToolCallingRoundTrips(int maxToolCallingRoundTrips) {
+        context.toolService.maxToolCallingRoundTrips(maxToolCallingRoundTrips);
         return this;
+    }
+
+    /**
+     * Sets the size of the bounded back-pressure buffer used by the reactive ({@code Flow.Publisher}) streaming
+     * path. Events are relayed to the subscriber through this buffer; if the subscriber consumes slower than the
+     * model produces and the buffer overflows, the stream terminates with an {@link IllegalStateException}.
+     * <p>
+     * The default is {@value AiServiceStreamingEventPublisher#DEFAULT_BUFFER_SIZE}. Raise it for a slow-but-correct
+     * consumer on long responses, or set it to {@link Integer#MAX_VALUE} for an effectively unbounded buffer
+     * (accepting the {@link OutOfMemoryError} risk). Has no effect on the synchronous, {@code CompletableFuture}
+     * or {@code TokenStream} return types.
+     *
+     * @param streamingBufferSize the buffer size; must be greater than zero
+     * @return the builder instance
+     * @since 1.20.0
+     */
+    @Experimental
+    public AiServices<T> streamingBufferSize(int streamingBufferSize) {
+        context.streamingBufferSize = streamingBufferSize;
+        return this;
+    }
+
+    /**
+     * @deprecated Use {@link #maxToolCallingRoundTrips(int)} instead.
+     */
+    @Deprecated(since = "1.15.0")
+    public AiServices<T> maxSequentialToolsInvocations(int maxSequentialToolsInvocations) {
+        return maxToolCallingRoundTrips(maxSequentialToolsInvocations);
     }
 
     /**
@@ -698,7 +780,7 @@ public abstract class AiServices<T> {
 
     /**
      * Configures the handler to be invoked when errors related to tool arguments occur,
-     * such as JSON parsing failures or mismatched argument types.
+     * such as JSON parsing failures, missing required parameters, or mismatched argument types.
      * <p>
      * Within this handler, you can either:
      * <p>
@@ -707,13 +789,34 @@ public abstract class AiServices<T> {
      * 2. Return a text message (e.g., an error description) that will be sent back to the LLM,
      * allowing it to respond appropriately (for example, by correcting the error and retrying).
      * <p>
+     * <b>Recommendation:</b> the current default (throw) is rarely what you want.
+     * Argument errors usually originate from the LLM (malformed JSON, missing fields, wrong types),
+     * and LLMs can typically self-correct when given a clear error message. Configuring a handler
+     * that returns the error text via {@link ToolErrorHandlerResult#text(String)} lets the LLM retry,
+     * which is more in line with how agentic systems are expected to behave.
+     * The default will change to {@link ToolArgumentsErrorHandler#sendExceptionMessageToLlm()}
+     * in an upcoming release.
+     * <p>
+     * Example:
+     * <pre>{@code
+     * .toolArgumentsErrorHandler((error, ctx) -> ToolErrorHandlerResult.text(error.getMessage()))
+     * }</pre>
+     * <p>
      * NOTE: If you create a {@link DefaultToolExecutor} manually or use a custom {@link ToolExecutor},
      * ensure that a {@link ToolArgumentsException} is thrown by {@link ToolExecutor} in such cases.
      * For {@link DefaultToolExecutor}, you can enable this by setting
      * {@link DefaultToolExecutor.Builder#wrapToolArgumentsExceptions(Boolean)} to {@code true}.
      *
+     * <p>
+     * <b>Defaults differ by mode.</b> Without an explicit handler, the synchronous and {@link TokenStream}
+     * modes fail the invocation on a tool argument-parse error, while the asynchronous and reactive modes
+     * ({@link java.util.concurrent.CompletableFuture}, {@link java.util.concurrent.Flow.Publisher}) send the error to the LLM so it can retry with corrected arguments.
+     * A handler set here is used by every mode.
+     *
      * @param handler The handler responsible for processing tool argument errors
      * @return builder
+     * @see ToolArgumentsErrorHandler#sendExceptionMessageToLlm()
+     * @see ToolArgumentsErrorHandler#failInvocation()
      * @see #hallucinatedToolNameStrategy(Function)
      * @see #toolExecutionErrorHandler(ToolExecutionErrorHandler)
      */
@@ -734,13 +837,39 @@ public abstract class AiServices<T> {
      * This is the default behavior if no handler is configured.
      * The {@link Throwable#getMessage()} is sent to the LLM by default.
      * <p>
+     * <b>Recommendation:</b> the current default sends the raw exception message to the LLM,
+     * which can leak internal application data — stack traces, file paths, downstream API responses,
+     * credentials and/or PII embedded in error strings, etc.
+     * Once fed to the LLM, this content can flow into responses, chat history, observability pipelines,
+     * and the LLM provider's logs. For production use, configure a handler that returns either a
+     * generic message or a sanitized/curated description of the failure, and rely on logs/events for
+     * the underlying detail.
+     * The default will change to {@link ToolExecutionErrorHandler#failInvocationUnlessVisibleToLlm()}
+     * in an upcoming release: the invocation fails, unless the exception itself says what
+     * the LLM may be told (see {@link dev.langchain4j.exception.ToolErrorVisibleToLlm}).
+     * <p>
+     * Example:
+     * <pre>{@code
+     * .toolExecutionErrorHandler((error, ctx) -> ToolErrorHandlerResult.text("Tool execution failed."))
+     * }</pre>
+     * <p>
      * NOTE: If you create a {@link DefaultToolExecutor} manually or use a custom {@link ToolExecutor},
      * ensure that a {@link ToolExecutionException} is thrown by {@link ToolExecutor} in such cases.
      * For {@link DefaultToolExecutor}, you can enable this by setting
      * {@link DefaultToolExecutor.Builder#propagateToolExecutionExceptions(Boolean)} to {@code true}.
      *
+     * <p>
+     * <b>Defaults differ by mode.</b> Without an explicit handler, the synchronous and {@link TokenStream}
+     * modes send a tool execution error to the LLM, while the asynchronous and reactive modes
+     * ({@link java.util.concurrent.CompletableFuture}, {@link java.util.concurrent.Flow.Publisher}) fail the invocation, rather than hiding the error from you.
+     * A handler set here is used by every mode.
+     *
      * @param handler The handler responsible for processing tool execution errors
      * @return builder
+     * @see ToolExecutionErrorHandler#failInvocationUnlessVisibleToLlm()
+     * @see ToolExecutionErrorHandler#failInvocation()
+     * @see ToolExecutionErrorHandler#sendExceptionMessageToLlm()
+     * @see dev.langchain4j.exception.ToolErrorVisibleToLlm
      * @see #hallucinatedToolNameStrategy(Function)
      * @see #toolArgumentsErrorHandler(ToolArgumentsErrorHandler)
      */
@@ -781,6 +910,11 @@ public abstract class AiServices<T> {
      * This method provides a straightforward approach for those who do not require
      * a customized {@link RetrievalAugmentor}.
      * It configures a {@link DefaultRetrievalAugmentor} with the provided {@link ContentRetriever}.
+     * <br>
+     * On the asynchronous/reactive return types, if the retriever is not genuinely non-blocking the pipeline fails
+     * loudly. To offload a blocking retriever instead, build the augmentor explicitly and pass it via
+     * {@link #retrievalAugmentor(RetrievalAugmentor)}:
+     * {@code DefaultRetrievalAugmentor.builder().contentRetriever(r).offloadBlocking(true).build()}.
      *
      * @param contentRetriever The content retriever to be used by the AI Service.
      * @return builder
@@ -1184,6 +1318,20 @@ public abstract class AiServices<T> {
     }
 
     /**
+     * Enables or disables compensating actions on tool errors.
+     * When enabled, if any tool execution fails, all previously executed tools'
+     * compensating actions (declared via {@link dev.langchain4j.agent.tool.CompensateFor}) are called
+     * in reverse order to undo the effects of the successful tool calls.
+     *
+     * @param compensateOnToolErrors whether to run compensating actions on tool errors
+     * @return builder
+     */
+    public AiServices<T> compensateOnToolErrors(boolean compensateOnToolErrors) {
+        context.toolService.compensateOnToolErrors(compensateOnToolErrors);
+        return this;
+    }
+
+    /**
      * Constructs and returns the AI Service.
      *
      * @return An instance of the AI Service implementing the specified interface.
@@ -1206,14 +1354,17 @@ public abstract class AiServices<T> {
     public static void verifyModerationIfNeeded(Future<Moderation> moderationFuture) {
         if (moderationFuture != null) {
             try {
-                Moderation moderation = moderationFuture.get();
-                if (moderation.flagged()) {
-                    throw new ModerationException(
-                            String.format("Text \"%s\" violates content policy", moderation.flaggedText()), moderation);
-                }
+                verifyModeration(moderationFuture.get());
             } catch (InterruptedException | ExecutionException e) {
                 throw new RuntimeException(e);
             }
+        }
+    }
+
+    static void verifyModeration(Moderation moderation) {
+        if (moderation.flagged()) {
+            throw new ModerationException(
+                    String.format("Text \"%s\" violates content policy", moderation.flaggedText()), moderation);
         }
     }
 }

@@ -1,13 +1,13 @@
 package dev.langchain4j.model.openai;
 
-import dev.langchain4j.model.chat.request.ChatRequestParameters;
-import dev.langchain4j.model.chat.request.DefaultChatRequestParameters;
-
-import java.util.List;
-import java.util.Objects;
-
 import static dev.langchain4j.internal.Utils.copy;
 import static dev.langchain4j.internal.Utils.getOrDefault;
+
+import dev.langchain4j.model.chat.request.ChatRequestParameters;
+import dev.langchain4j.model.chat.request.DefaultChatRequestParameters;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 
 public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestParameters {
 
@@ -24,6 +24,7 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
     private final String safetyIdentifier;
     private final String promptCacheKey;
     private final String promptCacheRetention;
+    private final OpenAiPromptCacheOptions promptCacheOptions;
     private final String reasoningEffort;
     private final String reasoningSummary;
     private final String textVerbosity;
@@ -31,6 +32,7 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
     private final Boolean store;
     private final Boolean strictTools;
     private final Boolean strictJsonSchema;
+    private final List<Map<String, Object>> serverTools;
 
     private OpenAiResponsesChatRequestParameters(Builder builder) {
         super(builder);
@@ -44,6 +46,7 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
         this.safetyIdentifier = builder.safetyIdentifier;
         this.promptCacheKey = builder.promptCacheKey;
         this.promptCacheRetention = builder.promptCacheRetention;
+        this.promptCacheOptions = builder.promptCacheOptions;
         this.reasoningEffort = builder.reasoningEffort;
         this.reasoningSummary = builder.reasoningSummary;
         this.textVerbosity = builder.textVerbosity;
@@ -51,6 +54,7 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
         this.store = builder.store;
         this.strictTools = builder.strictTools;
         this.strictJsonSchema = builder.strictJsonSchema;
+        this.serverTools = copy(builder.serverTools);
     }
 
     public String previousResponseId() {
@@ -89,8 +93,22 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
         return promptCacheKey;
     }
 
+    /**
+     * Returns {@code prompt_cache_retention}, which applies to models older than {@code gpt-5.6}.
+     * On {@code gpt-5.6} and later use {@link #promptCacheOptions()} instead; OpenAI rejects a request
+     * that carries both.
+     */
     public String promptCacheRetention() {
         return promptCacheRetention;
+    }
+
+    /**
+     * Returns {@code prompt_cache_options}, supported by {@code gpt-5.6} and later.
+     *
+     * @since 1.21.0
+     */
+    public OpenAiPromptCacheOptions promptCacheOptions() {
+        return promptCacheOptions;
     }
 
     public String reasoningEffort() {
@@ -119,6 +137,10 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
 
     public Boolean strictJsonSchema() {
         return strictJsonSchema;
+    }
+
+    public List<Map<String, Object>> serverTools() {
+        return serverTools;
     }
 
     @Override
@@ -153,13 +175,15 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
                 && Objects.equals(safetyIdentifier, that.safetyIdentifier)
                 && Objects.equals(promptCacheKey, that.promptCacheKey)
                 && Objects.equals(promptCacheRetention, that.promptCacheRetention)
+                && Objects.equals(promptCacheOptions, that.promptCacheOptions)
                 && Objects.equals(reasoningEffort, that.reasoningEffort)
                 && Objects.equals(reasoningSummary, that.reasoningSummary)
                 && Objects.equals(textVerbosity, that.textVerbosity)
                 && Objects.equals(streamIncludeObfuscation, that.streamIncludeObfuscation)
                 && Objects.equals(store, that.store)
                 && Objects.equals(strictTools, that.strictTools)
-                && Objects.equals(strictJsonSchema, that.strictJsonSchema);
+                && Objects.equals(strictJsonSchema, that.strictJsonSchema)
+                && Objects.equals(serverTools, that.serverTools);
     }
 
     @Override
@@ -176,13 +200,15 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
                 safetyIdentifier,
                 promptCacheKey,
                 promptCacheRetention,
+                promptCacheOptions,
                 reasoningEffort,
                 reasoningSummary,
                 textVerbosity,
                 streamIncludeObfuscation,
                 store,
                 strictTools,
-                strictJsonSchema);
+                strictJsonSchema,
+                serverTools);
     }
 
     public static Builder builder() {
@@ -201,6 +227,7 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
         private String safetyIdentifier;
         private String promptCacheKey;
         private String promptCacheRetention;
+        private OpenAiPromptCacheOptions promptCacheOptions;
         private String reasoningEffort;
         private String reasoningSummary;
         private String textVerbosity;
@@ -208,6 +235,7 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
         private Boolean store;
         private Boolean strictTools;
         private Boolean strictJsonSchema;
+        private List<Map<String, Object>> serverTools;
 
         @Override
         public Builder overrideWith(ChatRequestParameters parameters) {
@@ -223,6 +251,7 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
                 safetyIdentifier(getOrDefault(p.safetyIdentifier(), safetyIdentifier));
                 promptCacheKey(getOrDefault(p.promptCacheKey(), promptCacheKey));
                 promptCacheRetention(getOrDefault(p.promptCacheRetention(), promptCacheRetention));
+                promptCacheOptions(getOrDefault(p.promptCacheOptions(), promptCacheOptions));
                 reasoningEffort(getOrDefault(p.reasoningEffort(), reasoningEffort));
                 reasoningSummary(getOrDefault(p.reasoningSummary(), reasoningSummary));
                 textVerbosity(getOrDefault(p.textVerbosity(), textVerbosity));
@@ -230,6 +259,7 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
                 store(getOrDefault(p.store(), store));
                 strictTools(getOrDefault(p.strictTools(), strictTools));
                 strictJsonSchema(getOrDefault(p.strictJsonSchema(), strictJsonSchema));
+                serverTools(getOrDefault(p.serverTools(), serverTools));
             }
             return this;
         }
@@ -284,6 +314,14 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
             return this;
         }
 
+        /**
+         * @since 1.21.0
+         */
+        public Builder promptCacheOptions(OpenAiPromptCacheOptions promptCacheOptions) {
+            this.promptCacheOptions = promptCacheOptions;
+            return this;
+        }
+
         public Builder reasoningEffort(String reasoningEffort) {
             this.reasoningEffort = reasoningEffort;
             return this;
@@ -316,6 +354,11 @@ public class OpenAiResponsesChatRequestParameters extends DefaultChatRequestPara
 
         public Builder strictJsonSchema(Boolean strictJsonSchema) {
             this.strictJsonSchema = strictJsonSchema;
+            return this;
+        }
+
+        public Builder serverTools(List<Map<String, Object>> serverTools) {
+            this.serverTools = serverTools;
             return this;
         }
 

@@ -1,5 +1,16 @@
 package dev.langchain4j.service.tool;
 
+import static dev.langchain4j.agent.tool.ReturnBehavior.IMMEDIATE;
+import static dev.langchain4j.agent.tool.ReturnBehavior.IMMEDIATE_IF_LAST;
+import static dev.langchain4j.agent.tool.ReturnBehavior.TO_LLM;
+import static dev.langchain4j.service.tool.ReturnBehaviorCombinationsTest.Outcome.REPROCESS;
+import static dev.langchain4j.service.tool.ReturnBehaviorCombinationsTest.Outcome.RETURN_IMMEDIATELY;
+import static dev.langchain4j.service.tool.ReturnBehaviorCombinationsTest.ToolStep.err;
+import static dev.langchain4j.service.tool.ReturnBehaviorCombinationsTest.ToolStep.ok;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.params.provider.Arguments.arguments;
+
 import dev.langchain4j.agent.tool.ReturnBehavior;
 import dev.langchain4j.agent.tool.Tool;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
@@ -8,27 +19,20 @@ import dev.langchain4j.model.chat.mock.ChatModelMock;
 import dev.langchain4j.model.chat.mock.StreamingChatModelMock;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.IllegalConfigurationException;
 import dev.langchain4j.service.Result;
 import dev.langchain4j.service.TokenStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Stream;
-
-import static dev.langchain4j.agent.tool.ReturnBehavior.IMMEDIATE;
-import static dev.langchain4j.agent.tool.ReturnBehavior.IMMEDIATE_IF_LAST;
-import static dev.langchain4j.agent.tool.ReturnBehavior.TO_LLM;
-import static dev.langchain4j.service.tool.ReturnBehaviorCombinationsTest.Outcome.RETURN_IMMEDIATELY;
-import static dev.langchain4j.service.tool.ReturnBehaviorCombinationsTest.Outcome.REPROCESS;
-import static dev.langchain4j.service.tool.ReturnBehaviorCombinationsTest.ToolStep.err;
-import static dev.langchain4j.service.tool.ReturnBehaviorCombinationsTest.ToolStep.ok;
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 /**
  * Parameterized verification of the immediate-return/reprocess decision for every interesting combination
@@ -43,6 +47,12 @@ class ReturnBehaviorCombinationsTest {
 
     interface Assistant {
         Result<String> chat(String message);
+
+        CompletableFuture<Result<String>> chatAsync(String message);
+
+        String chatString(String message);
+
+        void chatVoid(String message);
     }
 
     interface StreamingAssistant {
@@ -67,6 +77,16 @@ class ReturnBehaviorCombinationsTest {
         }
 
         @Tool(returnBehavior = IMMEDIATE)
+        public String immediate2_ok() {
+            return "immediate2";
+        }
+
+        @Tool(returnBehavior = IMMEDIATE)
+        public int immediateInteger_ok() {
+            return 1;
+        }
+
+        @Tool(returnBehavior = IMMEDIATE)
         public String immediate_err() {
             throw new IllegalStateException("boom (immediate)");
         }
@@ -80,6 +100,66 @@ class ReturnBehaviorCombinationsTest {
         public String immediate_if_last_err() {
             throw new IllegalStateException("boom (immediate_if_last)");
         }
+
+        @Tool(returnBehavior = IMMEDIATE)
+        public void immediateVoid_ok() {}
+
+        @Tool(returnBehavior = IMMEDIATE)
+        public String immediateNull_ok() {
+            System.out.println("**** immediateNull_ok");
+            return null;
+        }
+    }
+
+    /**
+     * Future-returning twins of the {@link Tools} methods exercised by {@link #combinations()}. Used to verify
+     * that the immediate-return/reprocess decision is identical when tool results arrive asynchronously
+     * (on the future's completion thread) rather than synchronously.
+     */
+    static class AsyncTools {
+
+        @Tool(returnBehavior = TO_LLM)
+        public CompletableFuture<String> to_llm_ok() {
+            return completedLater("to-llm");
+        }
+
+        @Tool(returnBehavior = TO_LLM)
+        public CompletableFuture<String> to_llm_err() {
+            return failedLater("boom (to_llm)");
+        }
+
+        @Tool(returnBehavior = IMMEDIATE)
+        public CompletableFuture<String> immediate_ok() {
+            return completedLater("immediate");
+        }
+
+        @Tool(returnBehavior = IMMEDIATE)
+        public CompletableFuture<String> immediate_err() {
+            return failedLater("boom (immediate)");
+        }
+
+        @Tool(returnBehavior = IMMEDIATE_IF_LAST)
+        public CompletableFuture<String> immediate_if_last_ok() {
+            return completedLater("immediate-if-last");
+        }
+
+        @Tool(returnBehavior = IMMEDIATE_IF_LAST)
+        public CompletableFuture<String> immediate_if_last_err() {
+            return failedLater("boom (immediate_if_last)");
+        }
+
+        private static CompletableFuture<String> completedLater(String value) {
+            return CompletableFuture.supplyAsync(
+                    () -> value, CompletableFuture.delayedExecutor(20, TimeUnit.MILLISECONDS));
+        }
+
+        private static CompletableFuture<String> failedLater(String message) {
+            return CompletableFuture.supplyAsync(
+                    () -> {
+                        throw new IllegalStateException(message);
+                    },
+                    CompletableFuture.delayedExecutor(20, TimeUnit.MILLISECONDS));
+        }
     }
 
     enum Outcome {
@@ -87,14 +167,18 @@ class ReturnBehaviorCombinationsTest {
         REPROCESS
     }
 
-    record ToolStep(ReturnBehavior behavior, boolean errors) {
+    record ToolStep(ReturnBehavior behavior, boolean errors, Optional<String> toolName) {
 
         static ToolStep ok(ReturnBehavior behavior) {
-            return new ToolStep(behavior, false);
+            return new ToolStep(behavior, false, Optional.empty());
         }
 
         static ToolStep err(ReturnBehavior behavior) {
-            return new ToolStep(behavior, true);
+            return new ToolStep(behavior, true, Optional.empty());
+        }
+
+        static ToolStep withToolName(ReturnBehavior behavior, String toolName) {
+            return new ToolStep(behavior, false, Optional.of(toolName));
         }
 
         @Override
@@ -137,17 +221,25 @@ class ReturnBehaviorCombinationsTest {
 
                 // single tool errors (the only call in the response errors)
                 arguments(List.of(err(TO_LLM)), REPROCESS),
-                arguments(List.of(err(IMMEDIATE)), REPROCESS),                // would return immediately without error
-                arguments(List.of(err(IMMEDIATE_IF_LAST)), REPROCESS),        // would return immediately without error
+                arguments(List.of(err(IMMEDIATE)), REPROCESS), // would return immediately without error
+                arguments(List.of(err(IMMEDIATE_IF_LAST)), REPROCESS), // would return immediately without error
 
                 // two tools, one errors — covers both first-errors and last-errors positions
                 arguments(List.of(err(IMMEDIATE), ok(IMMEDIATE)), REPROCESS), // would return immediately without error
                 arguments(List.of(ok(IMMEDIATE), err(IMMEDIATE)), REPROCESS), // would return immediately without error
-                arguments(List.of(err(TO_LLM), ok(IMMEDIATE_IF_LAST)), REPROCESS),  // would return immediately without error
-                arguments(List.of(ok(TO_LLM), err(IMMEDIATE_IF_LAST)), REPROCESS),  // would return immediately without error (last itself errors)
-                arguments(List.of(err(IMMEDIATE_IF_LAST), ok(TO_LLM)), REPROCESS),  // already REPROCESS without error
-                arguments(List.of(err(IMMEDIATE), ok(IMMEDIATE_IF_LAST)), REPROCESS),  // would return immediately without error
-                arguments(List.of(ok(IMMEDIATE), err(IMMEDIATE_IF_LAST)), REPROCESS),  // would return immediately without error (last itself errors)
+                arguments(
+                        List.of(err(TO_LLM), ok(IMMEDIATE_IF_LAST)),
+                        REPROCESS), // would return immediately without error
+                arguments(
+                        List.of(ok(TO_LLM), err(IMMEDIATE_IF_LAST)),
+                        REPROCESS), // would return immediately without error (last itself errors)
+                arguments(List.of(err(IMMEDIATE_IF_LAST), ok(TO_LLM)), REPROCESS), // already REPROCESS without error
+                arguments(
+                        List.of(err(IMMEDIATE), ok(IMMEDIATE_IF_LAST)),
+                        REPROCESS), // would return immediately without error
+                arguments(
+                        List.of(ok(IMMEDIATE), err(IMMEDIATE_IF_LAST)),
+                        REPROCESS), // would return immediately without error (last itself errors)
 
                 // three tools, error in any position — would-return-immediately mixes
                 arguments(List.of(err(TO_LLM), ok(IMMEDIATE), ok(IMMEDIATE_IF_LAST)), REPROCESS),
@@ -164,8 +256,7 @@ class ReturnBehaviorCombinationsTest {
         // First LLM response: the tool calls under test.
         // Second LLM response: a final text answer, consumed only when the loop reprocesses.
         ChatModelMock model = ChatModelMock.thatAlwaysResponds(
-                AiMessage.from(toolRequests.toArray(new ToolExecutionRequest[0])),
-                AiMessage.from("final answer"));
+                AiMessage.from(toolRequests.toArray(new ToolExecutionRequest[0])), AiMessage.from("final answer"));
 
         Assistant assistant = AiServices.builder(Assistant.class)
                 .chatModel(model)
@@ -193,15 +284,105 @@ class ReturnBehaviorCombinationsTest {
 
     @ParameterizedTest(name = "{0} -> {1}")
     @MethodSource("combinations")
+    void should_produce_expected_outcome__async(List<ToolStep> steps, Outcome expectedOutcome) throws Exception {
+
+        List<ToolExecutionRequest> toolRequests = toolRequestsFor(steps);
+
+        // First LLM response: the tool calls under test.
+        // Second LLM response: a final text answer, consumed only when the loop reprocesses.
+        ChatModelMock model = ChatModelMock.thatAlwaysResponds(
+                AiMessage.from(toolRequests.toArray(new ToolExecutionRequest[0])), AiMessage.from("final answer"));
+
+        Assistant assistant = AiServices.builder(Assistant.class)
+                .chatModel(model)
+                .tools(new Tools())
+                .build();
+
+        if (steps.stream().anyMatch(ToolStep::errors)) {
+            // new async default (CompletableFuture mode): a tool execution error fails the invocation
+            // instead of being sent to the LLM, so the loop never reprocesses
+            assertThatThrownBy(() -> assistant.chatAsync("go").get(10, TimeUnit.SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
+            assertThat(model.requests()).hasSize(1);
+            return;
+        }
+
+        Result<String> result = assistant.chatAsync("go").get(10, TimeUnit.SECONDS);
+
+        if (expectedOutcome == RETURN_IMMEDIATELY) {
+            assertThat(model.requests())
+                    .as("immediate return means a single LLM call (no reprocessing round trip)")
+                    .hasSize(1);
+            assertThat(result.content())
+                    .as("immediate return means no LLM-generated text content")
+                    .isNull();
+        } else {
+            assertThat(model.requests())
+                    .as("REPROCESS means a second LLM call to consume the tool results")
+                    .hasSize(2);
+            assertThat(result.content())
+                    .as("REPROCESS means the second LLM response wins")
+                    .isEqualTo("final answer");
+        }
+    }
+
+    @ParameterizedTest(name = "{0} -> {1}")
+    @MethodSource("combinations")
+    void should_produce_expected_outcome__async_tools(List<ToolStep> steps, Outcome expectedOutcome)
+            throws Exception {
+
+        List<ToolExecutionRequest> toolRequests = toolRequestsFor(steps);
+
+        // First LLM response: the tool calls under test.
+        // Second LLM response: a final text answer, consumed only when the loop reprocesses.
+        ChatModelMock model = ChatModelMock.thatAlwaysResponds(
+                AiMessage.from(toolRequests.toArray(new ToolExecutionRequest[0])), AiMessage.from("final answer"));
+
+        // the tools themselves return CompletableFuture, so the immediate-return/reprocess decision is made
+        // when the tool result arrives asynchronously - a different code path than the sync tools above
+        Assistant assistant = AiServices.builder(Assistant.class)
+                .chatModel(model)
+                .tools(new AsyncTools())
+                .executeToolsConcurrently()
+                .build();
+
+        if (steps.stream().anyMatch(ToolStep::errors)) {
+            // new async default: a tool execution error fails the invocation instead of going to the LLM
+            assertThatThrownBy(() -> assistant.chatAsync("go").get(10, TimeUnit.SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
+            assertThat(model.requests()).hasSize(1);
+            return;
+        }
+
+        Result<String> result = assistant.chatAsync("go").get(10, TimeUnit.SECONDS);
+
+        if (expectedOutcome == RETURN_IMMEDIATELY) {
+            assertThat(model.requests())
+                    .as("immediate return means a single LLM call (no reprocessing round trip)")
+                    .hasSize(1);
+            assertThat(result.content())
+                    .as("immediate return means no LLM-generated text content")
+                    .isNull();
+        } else {
+            assertThat(model.requests())
+                    .as("REPROCESS means a second LLM call to consume the tool results")
+                    .hasSize(2);
+            assertThat(result.content())
+                    .as("REPROCESS means the second LLM response wins")
+                    .isEqualTo("final answer");
+        }
+    }
+
+    @ParameterizedTest(name = "{0} -> {1}")
+    @MethodSource("combinations")
     void should_produce_expected_outcome__streaming(List<ToolStep> steps, Outcome expectedOutcome) throws Exception {
 
         List<ToolExecutionRequest> toolRequests = toolRequestsFor(steps);
 
         // First LLM response: the tool calls under test.
         // Second LLM response: a final text answer, consumed only when the loop reprocesses.
-        StreamingChatModelMock model = StreamingChatModelMock.thatAlwaysStreams(
-                AiMessage.from(toolRequests.toArray(new ToolExecutionRequest[0])),
-                AiMessage.from("final answer"));
+        StreamingChatModelMock model =
+                StreamingChatModelMock.thatAlwaysStreams(AiMessage.from(toolRequests), AiMessage.from("final answer"));
 
         StreamingAssistant assistant = AiServices.builder(StreamingAssistant.class)
                 .streamingChatModel(model)
@@ -209,9 +390,9 @@ class ReturnBehaviorCombinationsTest {
                 .build();
 
         CompletableFuture<ChatResponse> future = new CompletableFuture<>();
-        assistant.chat("go")
-                .onPartialResponse(ignored -> {
-                })
+        assistant
+                .chat("go")
+                .onPartialResponse(ignored -> {})
                 .onCompleteResponse(future::complete)
                 .onError(future::completeExceptionally)
                 .start();
@@ -235,6 +416,70 @@ class ReturnBehaviorCombinationsTest {
         }
     }
 
+    @Test
+    public void testImmediateWithoutResultReturnType() {
+        // test single tool execution that returns void
+        List<ToolStep> steps = List.of(ToolStep.withToolName(IMMEDIATE, "immediateVoid"));
+        testImmediateWithoutResultReturnType(steps, assistant -> assistant.chatVoid("go"));
+        testImmediateWithoutResultReturnType(
+                steps, assistant -> assertThat(assistant.chatString("go")).isNull());
+
+        // test multiple tool executions all null.  Should be ok.
+        steps = List.of(
+                ToolStep.withToolName(IMMEDIATE, "immediateVoid"), ToolStep.withToolName(IMMEDIATE, "immediateNull"));
+        testImmediateWithoutResultReturnType(steps, assistant -> assistant.chatVoid("go"));
+        testImmediateWithoutResultReturnType(
+                steps, assistant -> assertThat(assistant.chatString("go")).isNull());
+
+        // test multiple tool executions with only one that has a non-null tool result
+        // this should be ok.
+        steps = List.of(
+                ToolStep.withToolName(IMMEDIATE, "immediateVoid"),
+                ToolStep.ok(IMMEDIATE),
+                ToolStep.withToolName(IMMEDIATE, "immediateNull"));
+        testImmediateWithoutResultReturnType(steps, assistant -> assistant.chatVoid("go"));
+        testImmediateWithoutResultReturnType(
+                steps, assistant -> assertThat(assistant.chatString("go")).isEqualTo("immediate"));
+
+        steps = List.of(ToolStep.withToolName(IMMEDIATE, "immediate2"), ToolStep.ok(IMMEDIATE));
+        // void return types should just return null
+        testImmediateWithoutResultReturnType(steps, assistant -> assistant.chatVoid("go"));
+
+        // there's 2 tool executions that have non-null result objects so exception should be thrown
+        try {
+            testImmediateWithoutResultReturnType(steps, assistant -> assistant.chatString("go"));
+        } catch (IllegalConfigurationException ex) {
+            // good!
+        }
+
+        // tool execution integer result object cannot resolve to String so exception should be thrown
+        steps = List.of(ToolStep.withToolName(IMMEDIATE, "immediateInteger"));
+        try {
+            testImmediateWithoutResultReturnType(steps, assistant -> assistant.chatString("go"));
+        } catch (IllegalConfigurationException ex) {
+            // good!
+        }
+    }
+
+    private void testImmediateWithoutResultReturnType(List<ToolStep> toolSteps, Consumer<Assistant> chat) {
+        List<ToolExecutionRequest> toolRequests = toolRequestsFor(toolSteps);
+        ChatModelMock model = ChatModelMock.thatAlwaysResponds(AiMessage.from(toolRequests));
+        Assistant assistant = AiServices.builder(Assistant.class)
+                .chatModel(model)
+                .tools(new Tools())
+                .build();
+        chat.accept(assistant);
+        assertThat(model.requests())
+                .as("immediate return means a single LLM call (no reprocessing round trip)")
+                .hasSize(1);
+    }
+
+    private static ChatModelMock createChatModelMock(List<ToolExecutionRequest> toolRequests) {
+        ChatModelMock model =
+                ChatModelMock.thatAlwaysResponds(AiMessage.from(toolRequests.toArray(new ToolExecutionRequest[0])));
+        return model;
+    }
+
     private static List<ToolExecutionRequest> toolRequestsFor(List<ToolStep> steps) {
         List<ToolExecutionRequest> toolRequests = new ArrayList<>();
         for (int i = 0; i < steps.size(); i++) {
@@ -248,11 +493,13 @@ class ReturnBehaviorCombinationsTest {
     }
 
     private static String toolNameFor(ToolStep step) {
-        String prefix = switch (step.behavior()) {
-            case TO_LLM -> "to_llm";
-            case IMMEDIATE -> "immediate";
-            case IMMEDIATE_IF_LAST -> "immediate_if_last";
-        };
+        String prefix = step.toolName().isPresent()
+                ? step.toolName.get()
+                : switch (step.behavior()) {
+                    case TO_LLM -> "to_llm";
+                    case IMMEDIATE -> "immediate";
+                    case IMMEDIATE_IF_LAST -> "immediate_if_last";
+                };
         return prefix + (step.errors() ? "_err" : "_ok");
     }
 }

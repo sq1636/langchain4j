@@ -63,7 +63,7 @@ class AnthropicAiServiceWithToolsIT extends AbstractAiServiceWithToolsIT {
             }
         }
 
-        SpyingHttpClient spyingHttpClient = new SpyingHttpClient(JdkHttpClient.builder().build());
+        SpyingHttpClient spyingHttpClient = new SpyingHttpClient(JdkHttpClient.builder());
 
         String deferLoadingKey = "defer_loading";
 
@@ -133,12 +133,12 @@ class AnthropicAiServiceWithToolsIT extends AbstractAiServiceWithToolsIT {
                     """;
 
             @Tool(metadata = TOOL_METADATA)
-            String getWeather(String location, @P(value = "temperature unit", required = false) Unit unit) {
+            String getWeather(String location, @P(description = "temperature unit", required = false) Unit unit) {
                 return "sunny";
             }
         }
 
-        SpyingHttpClient spyingHttpClient = new SpyingHttpClient(JdkHttpClient.builder().build());
+        SpyingHttpClient spyingHttpClient = new SpyingHttpClient(JdkHttpClient.builder());
 
         ChatModel chatModel = AnthropicChatModel.builder()
                 .httpClientBuilder(new MockHttpClientBuilder(spyingHttpClient))

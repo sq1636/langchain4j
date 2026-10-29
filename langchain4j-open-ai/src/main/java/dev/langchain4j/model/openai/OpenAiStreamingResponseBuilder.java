@@ -3,6 +3,8 @@ package dev.langchain4j.model.openai;
 import static dev.langchain4j.internal.Utils.isNullOrBlank;
 import static dev.langchain4j.internal.Utils.isNullOrEmpty;
 import static dev.langchain4j.model.openai.internal.OpenAiUtils.finishReasonFrom;
+import static dev.langchain4j.model.openai.internal.OpenAiUtils.logProbsFrom;
+import static dev.langchain4j.model.openai.internal.OpenAiUtils.providerErrorMessageFrom;
 import static dev.langchain4j.model.openai.internal.OpenAiUtils.tokenUsageFrom;
 import static java.util.stream.Collectors.toList;
 
@@ -17,6 +19,8 @@ import dev.langchain4j.model.openai.internal.chat.ChatCompletionChoice;
 import dev.langchain4j.model.openai.internal.chat.ChatCompletionResponse;
 import dev.langchain4j.model.openai.internal.chat.Delta;
 import dev.langchain4j.model.openai.internal.chat.FunctionCall;
+import dev.langchain4j.model.openai.internal.chat.LogProb;
+import dev.langchain4j.model.openai.internal.chat.LogProbs;
 import dev.langchain4j.model.openai.internal.chat.ToolCall;
 import dev.langchain4j.model.openai.internal.completion.CompletionChoice;
 import dev.langchain4j.model.openai.internal.completion.CompletionResponse;
@@ -29,6 +33,7 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -59,6 +64,8 @@ public class OpenAiStreamingResponseBuilder {
     private final AtomicReference<FinishReason> finishReason = new AtomicReference<>();
     private final AtomicReference<SuccessfulHttpResponse> rawHttpResponse = new AtomicReference<>();
     private final Queue<ServerSentEvent> rawServerSentEvents = new ConcurrentLinkedQueue<>();
+    private final List<LogProb> logProbs = new CopyOnWriteArrayList<>();
+    private final AtomicReference<String> providerErrorMessage = new AtomicReference<>();
 
     private final boolean returnThinking;
     private final boolean accumulateToolCallId;
@@ -86,8 +93,16 @@ public class OpenAiStreamingResponseBuilder {
             if (parsedAndRawResponse.rawHttpResponse() != null) {
                 rawHttpResponse.set(parsedAndRawResponse.rawHttpResponse());
             }
-            if (parsedAndRawResponse.rawServerSentEvent() != null) {
-                rawServerSentEvents.add(parsedAndRawResponse.rawServerSentEvent());
+            ServerSentEvent rawServerSentEvent = parsedAndRawResponse.rawServerSentEvent();
+            if (rawServerSentEvent != null) {
+                rawServerSentEvents.add(rawServerSentEvent);
+                ChatCompletionResponse parsedResponse = parsedAndRawResponse.parsedResponse();
+                if (parsedResponse == null || isNullOrEmpty(parsedResponse.choices())) {
+                    String errorMessage = providerErrorMessageFrom(rawServerSentEvent.data());
+                    if (errorMessage != null) {
+                        providerErrorMessage.compareAndSet(null, errorMessage);
+                    }
+                }
             }
 
             append(parsedAndRawResponse.parsedResponse());
@@ -135,6 +150,11 @@ public class OpenAiStreamingResponseBuilder {
             this.finishReason.set(finishReasonFrom(finishReason));
         }
 
+        LogProbs logProbs = chatCompletionChoice.logprobs();
+        if (logProbs != null && logProbs.content() != null) {
+            this.logProbs.addAll(logProbs.content());
+        }
+
         Delta delta = chatCompletionChoice.delta();
         if (delta == null) {
             return;
@@ -164,6 +184,10 @@ public class OpenAiStreamingResponseBuilder {
 
         if (delta.toolCalls() != null) {
             for (ToolCall toolCall : delta.toolCalls()) {
+                if (isSentinel(toolCall)) {
+                    continue;
+                }
+
                 int toolCallIndex = toolCall.index() != null ? toolCall.index() : fallbackToolCallIndex.get();
 
                 ToolExecutionRequestBuilder builder = this.indexToToolExecutionRequestBuilder.computeIfAbsent(
@@ -189,11 +213,13 @@ public class OpenAiStreamingResponseBuilder {
                 }
 
                 FunctionCall functionCall = toolCall.function();
-                if (functionCall.name() != null) {
-                    builder.nameBuilder.append(functionCall.name());
-                }
-                if (functionCall.arguments() != null) {
-                    builder.argumentsBuilder.append(functionCall.arguments());
+                if (functionCall != null) {
+                    if (functionCall.name() != null) {
+                        builder.nameBuilder.append(functionCall.name());
+                    }
+                    if (functionCall.arguments() != null) {
+                        builder.argumentsBuilder.append(functionCall.arguments());
+                    }
                 }
             }
         }
@@ -228,6 +254,15 @@ public class OpenAiStreamingResponseBuilder {
         if (token != null) {
             this.contentBuilder.append(token);
         }
+    }
+
+    /**
+     * Returns an error message if the provider sent an error inside the stream
+     * (e.g. {@code data: {"error": {...}}}), otherwise {@code null}.
+     */
+    public String errorMessage() {
+        String providerError = providerErrorMessage.get();
+        return providerError == null ? null : "Chat completion failed: " + providerError;
     }
 
     public ChatResponse build() {
@@ -290,7 +325,24 @@ public class OpenAiStreamingResponseBuilder {
                 .systemFingerprint(systemFingerprint.get())
                 .rawHttpResponse(rawHttpResponse.get())
                 .rawServerSentEvents(new ArrayList<>(rawServerSentEvents))
+                .logProbs(
+                        logProbs.isEmpty()
+                                ? null
+                                : logProbsFrom(LogProbs.builder()
+                                        .content(new ArrayList<>(logProbs))
+                                        .build()))
                 .build();
+    }
+
+    private static boolean isSentinel(ToolCall toolCall) {
+        boolean hasId = !isNullOrBlank(toolCall.id());
+        FunctionCall functionCall = toolCall.function();
+        if (functionCall == null) {
+            return !hasId;
+        }
+        boolean hasName = !isNullOrBlank(functionCall.name());
+        boolean hasArguments = functionCall.arguments() != null;
+        return !hasId && !hasName && !hasArguments;
     }
 
     private static class ToolExecutionRequestBuilder {
